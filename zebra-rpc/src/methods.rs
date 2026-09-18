@@ -294,11 +294,14 @@ pub trait Rpc {
     /// # Parameters
     ///
     /// - `hash_or_height`: (string, required, example="1") The hash or height for the block to be returned.
-    /// - `verbosity`: (number, optional, default=1, example=1) 0 for hex encoded data, 1 for a json object, and 2 for json object with transaction data.
+    /// - `verbosity`: (number, optional, default=1, example=1) 0 for hex encoded data, 1 for a json object, 2 for a json object with transaction data, and 3 for a json object with transaction data including prevout information for inputs.
     ///
     /// # Notes
     ///
-    /// The `size` field is only returned with verbosity=2.
+    /// The `size` field is only returned with verbosity>=2.
+    ///
+    /// Verbosity 3 adds a `prevout` object to each transparent input and a `fee` field to each
+    /// non-coinbase transaction, matching Bitcoin Core's `getblock` verbosity 3.
     ///
     /// The undocumented `chainwork` field is not returned.
     #[method(name = "getblock")]
@@ -937,6 +940,65 @@ where
     BlockVerifierRouter: BlockVerifierService,
     SyncStatus: ChainSyncStatus + Clone + Send + Sync + 'static,
 {
+    /// Looks up the output each transparent input of `tx` spends in the best chain, then fills in
+    /// the `prevout` objects and `fee` on `object`, for `getblock` verbosity 3.
+    ///
+    /// Coinbase transactions spend no outputs and have no fee, so they are left unchanged. A spent
+    /// output that cannot be found (for example, a side-chain block's input that is not in the
+    /// best chain) is skipped: its input gets no `prevout`, and its transaction gets no `fee`.
+    async fn add_transaction_prevouts(
+        &self,
+        object: &mut TransactionObject,
+        tx: &Arc<Transaction>,
+        network: &Network,
+    ) -> Result<()> {
+        // Coinbase transactions spend no outputs.
+        if tx.is_coinbase() {
+            return Ok(());
+        }
+
+        let outpoints: Vec<_> = tx.spent_outpoints().collect();
+
+        let mut futs = FuturesOrdered::new();
+        for outpoint in &outpoints {
+            futs.push_back(
+                self.read_state
+                    .clone()
+                    .oneshot(zebra_state::ReadRequest::Transaction(outpoint.hash)),
+            );
+        }
+
+        // The spent outputs found in the best chain, keyed by outpoint.
+        let mut spent_utxos = HashMap::with_capacity(outpoints.len());
+        for outpoint in &outpoints {
+            let response = futs
+                .next()
+                .await
+                .expect("one response per spent outpoint")
+                .map_misc_error()?;
+            let zebra_state::ReadResponse::Transaction(mined_tx) = response else {
+                unreachable!("unmatched response to a Transaction request");
+            };
+
+            if let Some(mined_tx) = mined_tx {
+                if let Some(output) = mined_tx.tx.outputs().get(outpoint.index as usize) {
+                    spent_utxos.insert(
+                        *outpoint,
+                        zebra_chain::transparent::Utxo::new(
+                            output.clone(),
+                            mined_tx.height,
+                            mined_tx.tx.is_coinbase(),
+                        ),
+                    );
+                }
+            }
+        }
+
+        object.add_prevouts(tx, &spent_utxos, network);
+
+        Ok(())
+    }
+
     /// Create a new instance of the RPC handler.
     //
     // TODO:
@@ -1542,7 +1604,7 @@ where
                 }
                 _ => unreachable!("unmatched response to a block request"),
             }
-        } else if matches!(verbosity, 1 | 2) {
+        } else if matches!(verbosity, 1..=3) {
             // Reuse the already-resolved `hash_or_height` (rather than the
             // caller-supplied string) so `get_block_header` resolves to the same
             // block this call resolved above, even for tip-relative inputs like a
@@ -1585,7 +1647,7 @@ where
             let hash_or_height = hash.into();
             let transactions_request = match verbosity {
                 1 => zebra_state::ReadRequest::TransactionIdsForBlock(hash_or_height),
-                2 => zebra_state::ReadRequest::BlockAndSize(hash_or_height),
+                2 | 3 => zebra_state::ReadRequest::BlockAndSize(hash_or_height),
                 _other => panic!("get_block_header_fut should be none"),
             };
 
@@ -1631,24 +1693,27 @@ where
                 zebra_state::ReadResponse::BlockAndSize(block_and_size) => {
                     let (block, size) = block_and_size.ok_or_misc_error("Block not found")?;
                     let block_time = block.header.time;
-                    let transactions = block
-                        .transactions
-                        .iter()
-                        .map(|tx| {
-                            GetBlockTransaction::Object(Box::new(
-                                TransactionObject::from_transaction(
-                                    tx.clone(),
-                                    Some(height),
-                                    Some(confirmations),
-                                    &network,
-                                    Some(block_time),
-                                    Some(hash),
-                                    Some(in_active_chain),
-                                    tx.hash(),
-                                ),
-                            ))
-                        })
-                        .collect();
+                    let mut transactions = Vec::with_capacity(block.transactions.len());
+                    for tx in block.transactions.iter() {
+                        let mut object = TransactionObject::from_transaction(
+                            tx.clone(),
+                            Some(height),
+                            Some(confirmations),
+                            &network,
+                            Some(block_time),
+                            Some(hash),
+                            Some(in_active_chain),
+                            tx.hash(),
+                        );
+
+                        // Verbosity 3 adds each input's prevout and the transaction fee.
+                        if verbosity == 3 {
+                            self.add_transaction_prevouts(&mut object, tx, &network)
+                                .await?;
+                        }
+
+                        transactions.push(GetBlockTransaction::Object(Box::new(object)));
+                    }
                     (transactions, Some(size))
                 }
                 _ => unreachable!("unmatched response to a transaction_ids_for_block request"),
